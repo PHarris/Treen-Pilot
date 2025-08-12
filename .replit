@@ -1,0 +1,13 @@
+modules = ["python-3.12"]
+run = "python main.py"
+
+[nix]
+channel = "stable-25_05"
+packages = ["rapidfuzz-cpp", "taskflow"]
+
+[deployment]
+run = ["sh", "-c", "python main.py"]
+
+[[ports]]
+localPort = 5000
+externalPort = 80

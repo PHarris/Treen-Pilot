@@ -1,0 +1,6 @@
+.env
+__pycache__/
+.pythonlibs/
+.upm/
+*.pyc
+*.pyo

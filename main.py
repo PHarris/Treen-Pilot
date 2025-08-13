@@ -1,162 +1,145 @@
-# main.py — TrendPilot backend (Render/Replit/GitHub friendly)
-
-import os, io, base64
+# main.py
+import os, base64, io
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 
+# Your modules
+from content_generator import generate_social_copy
+from generate_copy_enhanced import generate_social_media_caption
+
 load_dotenv()
 
-# ----- CORS (comma-separated list in CORS_ORIGINS) ---------------------------
-_cors = os.getenv("CORS_ORIGINS", "*")
-origins = [o.strip() for o in _cors.split(",") if o.strip()] if _cors else ["*"]
-
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": origins}})
 
-# ----- Local modules (these files must be beside main.py) --------------------
-from generate_copy_enhanced import (
-    generate_social_media_caption,
-    generate_social_media_hashtags,
-    extract_key_words,
+# --- CORS: allow your Netlify origin (or * for quick test) ---
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
+CORS(
+    app,
+    resources={r"/api/*": {"origins": CORS_ORIGINS}},
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+    supports_credentials=False,
 )
-from match_assets import match_asset_to_copy
-from image_utils import build_image_prompt
-from google_trends_adapter import get_trending_terms
-
-# ----- Optional OpenAI helpers ----------------------------------------------
-def try_openai_text(topic, platform, tone, trend):
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-
-        sys = (
-            "Act as if you're the best social copywriter in the world. "
-            "Write one concise, high-converting social caption. Keep under 220 words."
-        )
-        user = (
-            f"Platform: {platform}\n"
-            f"Tone: {tone}\n"
-            f"Topic: {topic}\n"
-            f"Trend: {trend or ''}\n"
-            "Constraints: No hashtags in caption. Friendly CTA at end."
-        )
-
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
-            temperature=0.8,
-            max_tokens=220,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        print("OpenAI text error:", e)
-        return None
-
-
-def try_openai_image(prompt, size="1024x1024"):
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        res = client.images.generate(model="gpt-image-1", prompt=prompt, size=size)
-        return res.data[0].b64_json
-    except Exception as e:
-        print("OpenAI image error:", e)
-        return None
-
-# ----- Health & root ---------------------------------------------------------
-@app.get("/")
-def root():
-    return jsonify({"status": "ok", "service": "trendpilot-api"})
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "trendpilot-api", "cors": origins})
+    return jsonify({"ok": True, "env": {"CORS_ORIGINS": CORS_ORIGINS[:3]}})
 
-# ----- Content generation ----------------------------------------------------
+# --- Helpers ---
+def _safe_get_json(req):
+    try:
+        return req.get_json(force=True) or {}
+    except Exception as e:
+        print(f"[api] JSON parse error: {e}")
+        return {}
+
+def _make_hashtags_from_keywords(keywords):
+    # very simple fallback
+    tags = []
+    for k in (keywords or []):
+        k = "".join(ch for ch in k if ch.isalnum() or ch == " ").strip()
+        if not k:
+            continue
+        tag = "#" + k.replace(" ", "")
+        if tag not in tags:
+            tags.append(tag)
+    return " ".join(tags[:12])
+
+# --- Generate copy (caption + hashtags + keywords) ---
 @app.post("/api/content/generate")
-def generate_content():
-    data = request.get_json(force=True) or {}
-    topic = (data.get("topic") or "").strip()
-    trend = (data.get("trend") or "").strip()
-    platform = (data.get("platform") or "instagram").strip().lower()
-    tone = (data.get("tone") or "engaging").strip()
+def api_generate_content():
+    payload = _safe_get_json(request)
+    topic = payload.get("topic", "").strip()
+    platform = payload.get("platform", "instagram").strip().lower()
+    tone = payload.get("tone", "engaging").strip().lower()
+    trend = payload.get("trend", "")
 
-    caption = try_openai_text(topic, platform, tone, trend) or generate_social_media_caption(
-        topic, platform, tone, trend
-    )
-    hashtags = generate_social_media_hashtags(topic, trend)
-    keywords = extract_key_words(f"{topic} {trend}")
-    asset = match_asset_to_copy(caption)
+    if not topic:
+        return jsonify({"error": "Missing field: topic"}), 400
 
-    return jsonify(
-        {
-            "success": True,
-            "caption": caption,
-            "hashtags": " ".join(hashtags),
-            "keywords": keywords,
-            "recommended_asset": asset,
+    try:
+        # 1) Primary: use your OpenAI-based generator (returns caption string)
+        prompt = f"Topic: {topic}\nPlatform: {platform}\nTone: {tone}\nTrend: {trend}"
+        caption = (generate_social_copy(prompt) or "").strip()
+
+        # 2) Use your enhanced template to propose hashtags/keywords (safe even without API key)
+        template = generate_social_media_caption(topic, platform=platform, tone=tone, trend=trend)
+        # template is expected to be a dict; keep it safe:
+        if isinstance(template, dict):
+            t_caption = template.get("caption", "").strip()
+            hashtags = template.get("hashtags", "")
+            keywords = template.get("keywords", [])
+            # Prefer AI caption if it returned something, otherwise template caption
+            if not caption:
+                caption = t_caption
+        else:
+            hashtags = ""
+            keywords = []
+
+        # Fallback tags if none
+        if not hashtags:
+            hashtags = _make_hashtags_from_keywords(keywords or [topic, tone, trend])
+
+        resp = {
+            "caption": caption or f"{topic} — {tone.title()}",
+            "hashtags": hashtags,
+            "keywords": keywords or [topic],
+            "recommended_asset": None  # reserved for Phase 2 (DAM)
         }
-    )
+        return jsonify(resp), 200
 
-# ----- Image generation ------------------------------------------------------
+    except Exception as e:
+        print(f"[api] /api/content/generate error: {e}")
+        # Final fallback so frontend still renders
+        resp = {
+            "caption": f"{topic} — {tone.title()}",
+            "hashtags": _make_hashtags_from_keywords([topic, tone, trend]),
+            "keywords": [topic, tone],
+            "recommended_asset": None
+        }
+        return jsonify(resp), 200
+
+# --- Generate image ---
 @app.post("/api/content/generate_image")
-def generate_image():
-    data = request.get_json(force=True) or {}
-    topic = (data.get("topic") or "").strip()
-    tone = (data.get("tone") or "").strip()
-    caption = (data.get("caption") or "").strip()
-    size = data.get("size") or "1024x1024"
+def api_generate_image():
+    """
+    Returns base64 PNG. Uses placeholder if no OPENAI_API_KEY or any error.
+    """
+    data = _safe_get_json(request)
+    topic = data.get("topic", "")
+    tone = data.get("tone", "")
+    caption = data.get("caption", "")
+    size = data.get("size", "1024x1024")
 
-    subject = data.get("subject")
-    style = data.get("style")
-    background = data.get("background")
-    lighting = data.get("lighting")
-    color_palette = data.get("color_palette")
-
-    prompt = build_image_prompt(topic, tone, caption, subject, style, background, lighting, color_palette)
-
-    b64 = try_openai_image(prompt, size=size)
-    if not b64:
-        # Fallback PNG so the route always works
+    # Try OpenAI images if key exists
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
         try:
-            from PIL import Image, ImageDraw
-            (w, h) = (1024, 1024) if size == "1024x1024" else (512, 512)
-            img = Image.new("RGB", (w, h), (245, 248, 252))
-            dr = ImageDraw.Draw(img)
-            dr.rectangle((40, 40, w - 40, h - 40), outline=(46, 125, 255), width=8)
-            dr.text((60, h // 2 - 10), f"{topic[:30]}...", fill=(20, 23, 26))
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-            return jsonify({"success": True, "image_base64": b64, "mime": "image/png", "fallback": True})
+            from openai import OpenAI
+            client = OpenAI(api_key=key)
+            resp = client.images.generate(
+                model="gpt-image-1",
+                prompt=f"{topic}. Tone: {tone}. Caption: {caption}",
+                size=size,
+                response_format="b64_json",
+            )
+            b64 = resp.data[0].b64_json
+            return jsonify({"image_base64": b64, "mime": "image/png", "fallback": False}), 200
         except Exception as e:
-            return jsonify({"success": False, "error": f"Could not generate image: {e}"}), 500
+            print(f"[api] OpenAI image error: {e}")
 
-    return jsonify({"success": True, "image_base64": b64, "mime": "image/png"})
+    # Placeholder PNG (simple gray)
+    import PIL.Image as Image
+    import PIL.ImageDraw as ImageDraw
+    img = Image.new("RGB", (1024, 1024), (240, 240, 240))
+    d = ImageDraw.Draw(img)
+    d.text((40, 40), "Placeholder image\n(no OPENAI_API_KEY)", fill=(60, 60, 60))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return jsonify({"image_base64": b64, "mime": "image/png", "fallback": True}), 200
 
-# ----- Trends ----------------------------------------------------------------
-@app.get("/api/trends")
-def api_trends():
-    platform = (request.args.get("platform") or "instagram").lower()
-    geo = os.getenv("TRENDS_GEO", "GB")
-    lang = os.getenv("TRENDS_LANG", "en-GB")
-    ttl = int(os.getenv("TRENDS_TTL", "900"))
-
-    terms = get_trending_terms(geo=geo, lang=lang, tz=0, ttl=ttl)
-    shaped = terms[:20]
-    if platform in ("tiktok", "x"):
-        shaped = [("#" + t.replace(" ", "")) if not t.startswith("#") else t for t in shaped]
-
-    return jsonify({"success": True, "platform": platform, "trends": shaped, "geo": geo})
-
-# ----- Local dev entrypoint --------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)

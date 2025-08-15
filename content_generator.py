@@ -1,46 +1,61 @@
 # content_generator.py
-import os
+import os, requests
 from dotenv import load_dotenv
-from openai import OpenAI
 from generate_copy_enhanced import generate_social_media_caption
 
 load_dotenv()
 
-# Create the OpenAI client once (v1.x style). Do NOT pass proxies here.
-_client = None
-def _get_client():
-    global _client
-    if _client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            return None
-        _client = OpenAI(api_key=api_key)
-    return _client
+# Hardcoded Space URL (works even if the env var is missing)
+HF_SPACE_URL = os.environ.get(
+    "HF_SPACE_URL",
+    "https://peteharris3001-social-captioner.hf.space"
+)
 
+def _parse_prompt(prompt: str):
+    topic, platform, tone, trend = "", "instagram", "engaging", ""
+    for line in (prompt or "").splitlines():
+        lower = line.lower()
+        if lower.startswith("topic:"):
+            topic = line.split(":", 1)[1].strip()
+        elif lower.startswith("platform:"):
+            platform = (line.split(":", 1)[1].strip() or "instagram").lower()
+        elif lower.startswith("tone:"):
+            tone = (line.split(":", 1)[1].strip() or "engaging").lower()
+        elif lower.startswith("trend:"):
+            trend = line.split(":", 1)[1].strip()
+    return topic, platform, tone, trend
+
+def _call_hf_space(topic, platform, tone, trend):
+    """
+    Calls your Hugging Face Space's Gradio JSON endpoint.
+    Expects: {"data": [topic, platform, tone, trend]}
+    Returns: caption string or None.
+    """
+    url = HF_SPACE_URL.rstrip("/")
+    if not url:
+        return None
+    try:
+        payload = {"data": [topic, platform, tone, trend]}
+        r = requests.post(f"{url}/run/predict", json=payload, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and "data" in data and data["data"]:
+            return str(data["data"][0]).strip()
+    except Exception as e:
+        print(f"[hf] space call error: {e}")
+    return None
 
 def generate_social_copy(prompt: str) -> str:
     """
-    Returns a caption string.
-    - Uses OpenAI v1 SDK correctly.
-    - Falls back to your template generator if no key or on any error.
+    Primary: use HF Space (free). Fallback: template generator (always works).
     """
-    client = _get_client()
-    if client is None:
-        # Fallback: use your template generator (keeps MVP working without a key)
-        return generate_social_media_caption(prompt, platform="instagram", tone="engaging", trend="")
+    topic, platform, tone, trend = _parse_prompt(prompt)
 
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Act as if you're the best social copywriter in the world."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.8,
-            max_tokens=220,
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        # Log for Render logs; keep the app robust
-        print(f"OpenAI text error: {e}")
-        return generate_social_media_caption(prompt, platform="instagram", tone="engaging", trend="")
+    # 1) Try Space
+    caption = _call_hf_space(topic, platform, tone, trend)
+    if caption:
+        return caption
+
+    # 2) Fallback (keeps MVP running if Space is sleepy/down)
+    tpl = generate_social_media_caption(topic or prompt, platform=platform, tone=tone, trend=trend)
+    return (tpl["caption"] if isinstance(tpl, dict) else str(tpl)).strip()

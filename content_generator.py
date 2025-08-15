@@ -27,22 +27,29 @@ def _parse_prompt(prompt: str):
 
 def _call_hf_space(topic, platform, tone, trend):
     """
-    Calls your Hugging Face Space's Gradio JSON endpoint.
-    Expects: {"data": [topic, platform, tone, trend]}
-    Returns: caption string or None.
+    Calls the Hugging Face Space. Tries both Gradio API styles:
+      - /run/predict  (Gradio 4+)
+      - /api/predict  (Gradio 3)
+    Returns caption text or None.
     """
-    url = HF_SPACE_URL.rstrip("/")
-    if not url:
+    base = HF_SPACE_URL.rstrip("/") if HF_SPACE_URL else None
+    if not base:
         return None
-    try:
-        payload = {"data": [topic, platform, tone, trend]}
-        r = requests.post(f"{url}/run/predict", json=payload, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, dict) and "data" in data and data["data"]:
-            return str(data["data"][0]).strip()
-    except Exception as e:
-        print(f"[hf] space call error: {e}")
+
+    payload = {"data": [topic, platform, tone, trend]}
+    endpoints = [f"{base}/run/predict", f"{base}/api/predict"]  # try v4 then v3
+
+    for url in endpoints:
+        try:
+            r = requests.post(url, json=payload, timeout=60)
+            # Some Spaces return 200 with an error payload; enforce 2xx:
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and "data" in data and data["data"]:
+                return str(data["data"][0]).strip()
+        except Exception as e:
+            print(f"[hf] try {url} -> {e}")
+
     return None
 
 def generate_social_copy(prompt: str) -> str:
